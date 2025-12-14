@@ -207,22 +207,26 @@ def get_diff_html(text1, text2):
 # --- 侧边栏：配置 ---
 with st.sidebar:
     st.title("⚙️ 设置面板")
-    
+
     st.subheader("1. API 配置")
-    api_key = st.text_input("OpenAI API Key", placeholder="ms-06251eb2-c784-4b06-9009-9f7f2bd61602", type="password", help="留空则使用模拟模式")
-    base_url = st.text_input("Base URL (可选)", placeholder="https://api-inference.modelscope.cn/v1")
-    
+    # 设置默认API密钥和Base URL，优先从环境变量读取，如果没有则使用默认值
+    default_api_key = os.getenv("OPENAI_API_KEY", "ms-06251eb2-c784-4b06-9009-9f7f2bd61602")  # 默认为空，使用模拟模式
+    default_base_url = os.getenv("OPENAI_BASE_URL", "https://api-inference.modelscope.cn/v1")
+
+    api_key = st.text_input("OpenAI API Key", placeholder="ms-06251eb2-c784-4b06-9009-9f7f2bd61602", help="留空则使用模拟模式", value=default_api_key)
+    base_url = st.text_input("Base URL (可选)", placeholder="https://api-inference.modelscope.cn/v1", value=default_base_url)
+
     st.subheader("2. 模型路由")
     c1, c2 = st.columns(2)
     exec_model = c1.selectbox("执行模型", ["gpt-3.5-turbo", "gpt-4o", "gpt-4", 'Qwen/Qwen3-8B', 'deepseek-ai/DeepSeek-V3.1'], index=0)
     exec_temp = c2.slider("执行温度", 0.0, 1.0, 0.7)
-    
+
     eval_model = st.selectbox("评价模型", ["gpt-4", "gpt-4o", 'Qwen/Qwen3-8B', 'deepseek-ai/DeepSeek-V3.1'], index=0, help="建议使用强模型进行评分")
     opt_model = st.selectbox("优化模型", ["gpt-4", "gpt-4o", 'Qwen/Qwen3-8B', 'deepseek-ai/DeepSeek-V3.1'], index=0, help="建议使用强模型进行重写")
-    
+
     st.divider()
     st.info(f"模式: {'🔵 模拟模式' if not api_key else '🟢 API 模式'}")
-    
+
     if st.button("🗑️ 清空历史"):
         st.session_state.history = []
         st.session_state.logs = []
@@ -249,14 +253,21 @@ with col_input:
 
 with col_config:
     st.subheader("测试数据 & 预期")
-    vars_input = st.text_area("变量 (JSON)", value='{\n  "text": "The quick brown fox jumps over the lazy dog."\n}', height=100)
-    expect_input = st.text_area("预期回答 (用于评分)", value="这只敏捷的棕色狐狸跳过了这只懒惰的狗。", height=100)
-    
+
+    # 使用JSON数组格式支持多个测试用例
+    st.markdown("**测试用例 (JSON数组格式)**")
+    test_cases_input = st.text_area(
+        "测试用例 (JSON数组)",
+        value='[{\n  "name": "测试用例1",\n  "variables": {\n    "text": "The quick brown fox jumps over the lazy dog."\n  },\n  "expected": "这只敏捷的棕色狐狸跳过了这只懒惰的狗。"\n}]',
+        height=200,
+        help="输入JSON数组，每个元素包含name、variables和expected字段"
+    )
+
     st.markdown("---")
     c_iter, c_mode = st.columns(2)
     max_iters = c_iter.number_input("迭代次数", 1, 10, 3)
     mode = c_mode.radio("迭代模式", ["自动连续", "交互式(单步)"], horizontal=True)
-    
+
     auto_rollback = st.checkbox("📉 启用自动回滚 (分数下降时恢复)", value=True)
 
 # 操作栏
@@ -298,26 +309,75 @@ if st.session_state.is_running:
         status_container.write(f"🔄 正在执行第 {idx} 轮迭代...")
         log(f"=== 开始第 {idx} 轮 ===")
         
-        # 1. 渲染
-        rendered_prompt = render_prompt(current_p, vars_input)
-        
-        # 2. 执行
-        log("调用 LLM 执行...")
-        output = engine.execute(rendered_prompt, {"model": exec_model, "temperature": exec_temp})
-        
-        # 3. 评价
-        log("调用 LLM 评分...")
-        eval_res = engine.evaluate(rendered_prompt, output, expect_input, {"model": eval_model})
-        score = eval_res.get('score', 0)
-        log(f"本轮得分: {score}")
+        # 1. 解析测试用例
+        test_cases = []
+        try:
+            test_cases = json.loads(test_cases_input)
+            # 如果不是数组格式，转换为数组
+            if not isinstance(test_cases, list):
+                test_cases = [test_cases]
+        except Exception as e:
+            log(f"测试用例格式错误: {str(e)}")
+            # 使用默认测试用例
+            test_cases = [{
+                "name": "默认测试用例",
+                "variables": {"text": "The quick brown fox jumps over the lazy dog."},
+                "expected": "这只敏捷的棕色狐狸跳过了这只懒惰的狗。"
+            }]
+
+        # 2. 对所有测试用例进行评估
+        total_score = 0
+        eval_results = []
+
+        for idx, test_case in enumerate(test_cases):
+            case_name = test_case.get("name", f"测试用例 {idx+1}")
+            log(f"测试用例 {idx+1}: {case_name}")
+
+            # 获取变量和预期输出
+            variables = test_case.get("variables", {})
+            expected = test_case.get("expected", "")
+
+            # 将变量转换为JSON字符串（如果需要）
+            variables_str = variables if isinstance(variables, str) else json.dumps(variables, ensure_ascii=False)
+
+            # 渲染
+            rendered_prompt = render_prompt(current_p, variables_str)
+
+            # 执行
+            log("调用 LLM 执行...")
+            output = engine.execute(rendered_prompt, {"model": exec_model, "temperature": exec_temp})
+
+            # 评价
+            log("调用 LLM 评分...")
+            eval_res = engine.evaluate(rendered_prompt, output, expected, {"model": eval_model})
+            score = eval_res.get('score', 0)
+            log(f"测试用例 {idx+1} 得分: {score}")
+
+            eval_results.append({
+                "test_case": case_name,
+                "score": score,
+                "result": eval_res,
+                "output": output,
+                "variables": variables_str,
+                "expected": expected
+            })
+            total_score += score
+
+        # 计算平均分
+        avg_score = total_score / len(test_cases) if test_cases else 0
+        log(f"本轮平均得分: {avg_score}")
+
+        # 使用第一个测试用例的结果作为主要评估结果（用于优化）
+        eval_res = eval_results[0]["result"] if eval_results else {"score": 0, "reason": "无测试用例"}
         
         # 记录数据
         record = {
             "version": idx,
             "prompt_template": current_p,
-            "rendered_prompt": rendered_prompt,
-            "output": output,
-            "evaluation": eval_res,
+            "test_results": eval_results,
+            "test_cases_input": test_cases_input,  # 保存原始输入
+            "average_score": avg_score,
+            "evaluation": eval_res,  # 主要评估结果（第一个测试用例）
             "timestamp": datetime.datetime.now().isoformat(),
             "status": "normal"
         }
@@ -373,7 +433,17 @@ else:
     
     with tab1:
         # 版本选择器
-        versions = [f"v{h['version']} (Score: {h['evaluation']['score']}) {'↩️' if h['status']=='rolled_back' else ''}" for h in st.session_state.history]
+        versions = []
+        for h in st.session_state.history:
+            if 'average_score' in h:
+                test_case_count = len(h.get('test_results', []))
+                score_text = f"Avg Score: {round(h['average_score'], 1)} ({test_case_count} test cases)"
+            else:
+                # 兼容旧数据格式
+                score_text = f"Score: {h['evaluation']['score']}"
+            version_text = f"v{h['version']} ({score_text}) {'↩️' if h['status']=='rolled_back' else ''}"
+            versions.append(version_text)
+
         sel_idx = st.selectbox("选择版本查看", range(len(versions)), format_func=lambda x: versions[x])
         data = st.session_state.history[sel_idx]
         
@@ -381,16 +451,35 @@ else:
         with c1:
             st.markdown("#### 📝 提示词模板")
             st.code(data['prompt_template'], language='markdown')
-            
-            st.markdown("#### 🤖 实际输出")
-            st.info(data['output'])
-            
+
+            # 显示所有测试用例的结果
+            st.markdown("#### 🤖 测试结果")
+            if 'test_results' in data:
+                for test_result in data['test_results']:
+                    with st.expander(f"测试用例: {test_result['test_case']} (得分: {test_result['score']})"):
+                        st.markdown("**变量:**")
+                        st.code(test_result.get('variables', '{}'), language='json')
+                        st.markdown("**实际输出:**")
+                        st.info(test_result['output'])
+                        st.markdown("**预期输出:**")
+                        st.text(test_result.get('expected', ''))
+                        st.markdown("**评价理由:**")
+                        st.warning(test_result['result'].get('reason', '无'))
+            else:
+                # 兼容旧数据格式
+                st.info(data.get('output', '无输出'))
+
         with c2:
             st.markdown("#### 🏆 质量评估")
-            score = data['evaluation']['score']
-            st.metric("得分", score, delta=None)
-            st.warning(f"**评价理由**: {data['evaluation']['reason']}")
-            
+            if 'average_score' in data:
+                st.metric("平均得分", round(data['average_score'], 1), delta=None)
+            else:
+                # 兼容旧数据格式
+                score = data['evaluation']['score']
+                st.metric("得分", score, delta=None)
+
+            st.warning(f"**主要评价理由**: {data['evaluation']['reason']}")
+
             st.markdown("---")
             st.markdown("#### 🔧 人工干预")
             # 允许用户基于此版本修改
@@ -401,17 +490,38 @@ else:
 
     with tab2:
         if len(st.session_state.history) > 0:
-            scores = [h['evaluation']['score'] for h in st.session_state.history]
+            # 使用平均分绘制趋势图
+            scores = []
+            for h in st.session_state.history:
+                if 'average_score' in h:
+                    scores.append(h['average_score'])
+                else:
+                    # 兼容旧数据格式
+                    scores.append(h['evaluation']['score'])
+
             st.line_chart(scores)
-            
+
             # 数据表导出
             import pandas as pd
-            df = pd.DataFrame([{
-                "Version": h['version'],
-                "Score": h['evaluation']['score'],
-                "Output": h['output'][:50]+"...",
-                "Status": h['status']
-            } for h in st.session_state.history])
+            df_data = []
+            for h in st.session_state.history:
+                if 'average_score' in h:
+                    df_data.append({
+                        "Version": h['version'],
+                        "Avg Score": round(h['average_score'], 1),
+                        "Test Cases": len(h.get('test_results', [])),
+                        "Status": h['status']
+                    })
+                else:
+                    # 兼容旧数据格式
+                    df_data.append({
+                        "Version": h['version'],
+                        "Score": h['evaluation']['score'],
+                        "Output": h.get('output', '')[:50]+"...",
+                        "Status": h['status']
+                    })
+
+            df = pd.DataFrame(df_data)
             st.dataframe(df, use_container_width=True)
 
     with tab3:
